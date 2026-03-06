@@ -23,7 +23,13 @@
     </div>
 
     <div class="lobby-section">
-      <button class="btn btn-primary" id="btn-host">Host a Game</button>
+      <button class="btn btn-primary" id="btn-solo" style="background:linear-gradient(135deg,#e5c100,#ff9800);font-size:1.1rem;">Play Solo vs AI</button>
+    </div>
+
+    <div class="lobby-divider">or</div>
+
+    <div class="lobby-section">
+      <button class="btn btn-secondary" id="btn-host">Host a Game</button>
     </div>
 
     <div class="lobby-divider">or</div>
@@ -144,9 +150,11 @@
   let game = null;
   let localPlayerIdx = -1;
   let isHost = false;
+  let isSoloMode = false;
   let pendingGuestName = null;
   let nextHandTimer = null;
   let gameState = null; // cached for guest
+  let botTimer = null;
 
   // ── DOM References ──────────────────────────────────────────────────────────
   const els = {
@@ -197,6 +205,91 @@
     // Attach named refs to matching elements inside areas
     if (oppArea) {
       oppArea.querySelector('.player-cards') || oppArea.insertBefore(Object.assign(document.createElement('div'), {className: 'player-cards', id: 'opp-cards-inner'}), oppArea.firstChild);
+    }
+  }
+
+  // ── Solo Mode (vs AI) ──────────────────────────────────────────────────────
+  const btnSolo = document.getElementById('btn-solo');
+  btnSolo.addEventListener('click', function () {
+    const name = (els.playerName.value || 'Player').trim();
+    if (!name) { UI.showError('Enter your name first'); return; }
+    isSoloMode = true;
+    isHost = true;
+    localPlayerIdx = 0;
+    game = new GameEngine();
+    game.setPlayerNames(name, 'AI Bot');
+    UI.showGame();
+    els.bettingControls.style.display = 'flex';
+    els.btnNewGame.style.display = 'inline-flex';
+    game.startHand();
+    updateLocalView();
+    scheduleBotTurn();
+  });
+
+  function botDecide() {
+    if (!game || game.phase === 'lobby' || game.phase === 'showdown' || game.phase === 'gameover') return;
+    if (game.currentPlayerIdx !== 1) return; // not bot's turn
+
+    const bot = game.players[1];
+    const toCall = game.currentBet - bot.bet;
+    const actions = game.getValidActions(1);
+    const hand = bot.hand;
+    const community = game.communityCards;
+
+    // Simple AI: evaluate hand strength
+    let strength = 0;
+    if (hand.length === 2) {
+      // Preflop: score hole cards
+      const r1 = hand[0].rank, r2 = hand[1].rank;
+      const paired = r1 === r2;
+      const suited = hand[0].suit === hand[1].suit;
+      const highCard = Math.max(r1, r2);
+      const gap = Math.abs(r1 - r2);
+      strength = highCard / 14;
+      if (paired) strength += 0.3;
+      if (suited) strength += 0.1;
+      if (gap <= 2) strength += 0.05;
+    }
+    if (community.length >= 3) {
+      // Postflop: use hand evaluator
+      const allCards = [...hand, ...community];
+      const eval5 = evaluateHand(allCards);
+      strength = 0.2 + (eval5.value[0] / 9) * 0.8; // scale hand rank 0-9 to 0.2-1.0
+    }
+
+    // Add randomness
+    strength += (Math.random() - 0.5) * 0.15;
+
+    let action, amount;
+    if (strength > 0.7 && actions.includes('raise')) {
+      action = 'raise';
+      const minRaise = game.currentBet + game.lastRaiseAmount;
+      const maxRaise = bot.chips + bot.bet;
+      const raiseSize = Math.min(maxRaise, Math.floor(minRaise + (maxRaise - minRaise) * (strength - 0.7) / 0.3));
+      amount = Math.max(minRaise, raiseSize);
+    } else if (strength > 0.35 || toCall === 0) {
+      action = toCall === 0 ? 'check' : 'call';
+    } else {
+      action = toCall > bot.chips * 0.3 ? 'fold' : 'call';
+    }
+
+    if (!actions.includes(action)) {
+      action = actions.includes('check') ? 'check' : (actions.includes('call') ? 'call' : 'fold');
+    }
+
+    const result = game.placeBet(1, action, amount);
+    if (result && result.error) return;
+    updateLocalView();
+    checkPhaseTransitions();
+    scheduleBotTurn();
+  }
+
+  function scheduleBotTurn() {
+    if (!isSoloMode || !game) return;
+    if (botTimer) clearTimeout(botTimer);
+    if (game.phase === 'showdown' || game.phase === 'gameover' || game.phase === 'lobby') return;
+    if (game.currentPlayerIdx === 1) {
+      botTimer = setTimeout(botDecide, 800 + Math.random() * 1200);
     }
   }
 
@@ -262,8 +355,10 @@
 
   els.btnDisconnect.addEventListener('click', function () {
     if (confirm('Leave the game?')) {
-      Network.disconnect();
+      if (!isSoloMode) Network.disconnect();
       game = null;
+      isSoloMode = false;
+      if (botTimer) { clearTimeout(botTimer); botTimer = null; }
       UI.showLobby();
     }
   });
@@ -296,13 +391,21 @@
   });
 
   function submitAction(action, amount) {
+    if (isSoloMode) {
+      const result = game.placeBet(localPlayerIdx, action, amount);
+      if (result && result.error) { UI.showError(result.error); return; }
+      updateLocalView();
+      checkPhaseTransitions();
+      scheduleBotTurn();
+      return;
+    }
+
     if (!Network.isConnected()) {
       UI.showError('Not connected to opponent');
       return;
     }
 
     if (isHost) {
-      // Host runs game engine locally
       const result = game.placeBet(localPlayerIdx, action, amount);
       if (result && result.error) {
         UI.showError(result.error);
@@ -312,9 +415,7 @@
       updateLocalView();
       checkPhaseTransitions();
     } else {
-      // Guest sends action to host
       Network.sendAction(action, amount);
-      // Disable controls while waiting for state update
       disableControls();
     }
   }
@@ -363,8 +464,9 @@
   function startNextHand() {
     if (nextHandTimer) { clearTimeout(nextHandTimer); nextHandTimer = null; }
     game.startHand();
-    broadcastState();
+    if (!isSoloMode) broadcastState();
     updateLocalView();
+    scheduleBotTurn();
   }
 
   // ── Network Message Handler ─────────────────────────────────────────────────
